@@ -2600,9 +2600,27 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             and layer.head_dim == layer.qk_head_dim
         ):
             if save_kv_cache:
-                self._set_kv_buffer_native_dense(
-                    layer, forward_batch.out_cache_loc, k, v, forward_batch
-                )
+                if self.kv_cache_dtype == dtypes.fp8:
+                    k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(
+                        layer.layer_id
+                    )
+                    k_scale, v_scale = self._ensure_fp8_kv_scales(
+                        layer, k_buffer, self.page_size
+                    )
+                    self.set_kv_buffer_with_layout_shuffle(
+                        forward_batch.out_cache_loc,
+                        k,
+                        v,
+                        k_buffer,
+                        v_buffer,
+                        k_scale,
+                        v_scale,
+                        self.page_size,
+                    )
+                else:
+                    self._set_kv_buffer_native_dense(
+                        layer, forward_batch.out_cache_loc, k, v, forward_batch
+                    )
             return self._forward_decode_native_dense_mha(q, layer, forward_batch)
 
         o = q.new_empty((batch_size, layer.tp_q_head_num, head_dim_out))
@@ -2705,25 +2723,43 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             block_size = self.page_size
             num_slots, num_kv_heads, head_size = k_cache.shape
             num_blocks = num_slots // block_size
-            k_cache = k_cache[: num_blocks * block_size].view(
-                num_blocks, block_size, num_kv_heads, head_size
-            )
-            v_cache = v_cache[: num_blocks * block_size].view(
-                num_blocks, block_size, num_kv_heads, layer.v_head_dim
-            )
             x = 16 // k_cache.element_size()
-            k_cache = (
-                k_cache.view(num_blocks, block_size, num_kv_heads, head_size // x, x)
-                .permute(0, 2, 3, 1, 4)
-                .contiguous()
-            )
-            v_cache = (
-                v_cache.view(
-                    num_blocks, block_size // x, x, num_kv_heads, layer.v_head_dim
+            if self.kv_cache_dtype == dtypes.fp8:
+                # The fp8 cache is written by
+                # reshape_and_cache_with_pertoken_quant(asm_layout=True), so its
+                # flat SGLang storage already has the shuffle layout expected by
+                # Gluon PA. Reinterpreting it as NHD and permuting it corrupts
+                # both the token order and the packed head dimension.
+                k_cache = k_cache[: num_blocks * block_size].view(
+                    num_blocks, num_kv_heads, head_size // x, block_size, x
                 )
-                .permute(0, 3, 1, 4, 2)
-                .contiguous()
-            )
+                v_cache = v_cache[: num_blocks * block_size].view(
+                    num_blocks,
+                    num_kv_heads,
+                    block_size // x,
+                    layer.v_head_dim,
+                    x,
+                )
+            else:
+                # The bf16 forced-Triton path still receives NHD cache writes.
+                k_cache = (
+                    k_cache[: num_blocks * block_size]
+                    .view(num_blocks, block_size, num_kv_heads, head_size // x, x)
+                    .permute(0, 2, 3, 1, 4)
+                    .contiguous()
+                )
+                v_cache = (
+                    v_cache[: num_blocks * block_size]
+                    .view(
+                        num_blocks,
+                        block_size // x,
+                        x,
+                        num_kv_heads,
+                        layer.v_head_dim,
+                    )
+                    .permute(0, 3, 1, 4, 2)
+                    .contiguous()
+                )
             q_3d = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             out = torch.empty_like(q_3d, dtype=self.input_dtype)
             num_seqs = self.forward_metadata.kv_lens.shape[0]
@@ -2750,6 +2786,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 dtype=q.dtype,
                 device=q.device,
             )
+            k_scale, v_scale = self._kv_descales(layer)
+            if k_scale is not None and k_scale.numel() > 1:
+                k_scale = k_scale.unsqueeze(-1)
+                v_scale = v_scale.unsqueeze(-1)
             run_pa_decode_gluon(
                 output=out,
                 q=q_3d,
@@ -2761,10 +2801,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 max_seqlen_q=1,
                 max_context_partition_num=max_context_partition_num,
                 context_partition_size=context_partition_size,
-                compute_type=torch.bfloat16,
+                compute_type=(
+                    dtypes.fp8
+                    if self.kv_cache_dtype == dtypes.fp8
+                    else torch.bfloat16
+                ),
                 q_scale=None,
-                k_scale=None,
-                v_scale=None,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 exp_sums=exp_sums,
                 max_logits=max_logits,
                 temporary_output=temporary_output,
