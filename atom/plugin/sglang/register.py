@@ -143,7 +143,7 @@ def _install_mimo_v2_pool_symmetry_patch() -> None:
             mc, archs = None, []
         if (
             mc is not None
-            and "MiMoV2ForCausalLM" in archs
+            and any(arch in {"MiMoV2ForCausalLM", "MiMoV2MTP"} for arch in archs)
             and _is_atom_external_model_enabled()
         ):
             if mc.v_head_dim != mc.head_dim or mc.swa_v_head_dim != mc.swa_head_dim:

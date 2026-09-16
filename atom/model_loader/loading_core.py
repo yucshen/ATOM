@@ -215,6 +215,14 @@ def load_weights_into_model(
         else:
             fn(*args)
 
+        # Each future retains its arguments, including the checkpoint tensor,
+        # until the copy finishes.  An unbounded queue therefore keeps an
+        # entire large checkpoint resident on CPU for every TP process when
+        # the iterator outruns H2D/expert staging.  Apply backpressure while
+        # still leaving one full wave queued behind the workers.
+        if executor is not None and len(futures) >= 2 * num_threads:
+            futures.pop(0).result()
+
     batching_excluded = None
     if online_quant_streamer is not None:
         batching_excluded = online_quant_streamer.manages_param

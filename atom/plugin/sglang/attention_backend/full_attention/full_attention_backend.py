@@ -112,6 +112,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        architectures = list(
+            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+        )
+        self._mimo_mtp_uses_swa_pool = (
+            "MiMoV2MTP" in architectures and self.use_sliding_window_kv_pool
+        )
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -193,6 +199,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+        if self._mimo_mtp_uses_swa_pool:
+            return super().init_forward_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
@@ -210,6 +218,31 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
+        self._bind_mimo_mtp_swa_metadata(forward_batch)
+
+    def _bind_mimo_mtp_swa_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Translate full-pool scheduler locations for MiMo's all-SWA draft."""
+        if not self._mimo_mtp_uses_swa_pool or self.forward_metadata is None:
+            return
+        pool = self.token_to_kv_pool
+        if forward_batch.out_cache_loc is not None:
+            self.forward_metadata.swa_out_cache_loc = (
+                pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+            )
+        if self.forward_metadata.kv_indices is not None:
+            self.forward_metadata.swa_kv_indices = pool.translate_loc_from_full_to_swa(
+                self.forward_metadata.kv_indices
+            )
+        if self.forward_metadata.page_table is not None:
+            num_pages = self.forward_metadata.page_table.shape[1]
+            full_page_slots = self.req_to_token[
+                forward_batch.req_pool_indices[:, None],
+                self.strided_indices[:num_pages][None, :],
+            ]
+            self.forward_metadata.swa_page_table = (
+                pool.translate_loc_from_full_to_swa(full_page_slots)
+                // self.page_size
+            ).to(torch.int32)
 
     def init_forward_metadata_out_graph(
         self,
@@ -217,6 +250,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         in_capture: bool = False,
     ):
         """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
+        if self._mimo_mtp_uses_swa_pool:
+            return super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
         if in_capture:
             self.init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
@@ -239,9 +276,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
+        self._bind_mimo_mtp_swa_metadata(forward_batch)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
+        if self._mimo_mtp_uses_swa_pool:
+            return super().init_forward_metadata_in_graph(forward_batch)
         return
 
     def _init_forward_metadata_decode(self, forward_batch: ForwardBatch):
@@ -823,6 +863,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             raise RuntimeError("MHA target_verify requires speculative metadata")
 
         draft_num = spec_info.draft_token_num
+        kv_lens = forward_batch.seq_lens + draft_num
         qo_indptr = torch.arange(
             0,
             (1 + bs) * draft_num,
@@ -832,7 +873,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
 
         kv_indptr = self.kv_indptr[: bs + 1]
-        kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+        kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
         kv_indptr = kv_indptr[: bs + 1]
 
         kv_indices_len = int(kv_indptr[-1].item())
@@ -840,7 +881,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         create_flashinfer_kv_indices_triton[(bs,)](
             self.req_to_token,
             forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
+            kv_lens,
             kv_indptr,
             None,
             kv_indices,
@@ -858,7 +899,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             qo_indptr,
             None,
             draft_num,
-            None,
+            self._max_len(None, kv_lens),
             None,
             None,
             custom_mask=spec_info.custom_mask,
@@ -1757,6 +1798,14 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             sinks = sinks.to(torch.float32)
         return sinks
 
+    def _layer_cache_loc(self, layer, cache_loc):
+        if (
+            self._mimo_mtp_uses_swa_pool
+            and self.forward_metadata.swa_out_cache_loc is not None
+        ):
+            return self.forward_metadata.swa_out_cache_loc
+        return cache_loc
+
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
         return (
@@ -1880,6 +1929,16 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def forward_extend(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
+        if self._mimo_mtp_uses_swa_pool:
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=kwargs.get("sinks"),
+            )
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
             return self._forward_sparse_mla(
@@ -1891,6 +1950,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        cache_loc = self._layer_cache_loc(layer, cache_loc)
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
 
         if k is not None:
@@ -1922,6 +1982,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
+        if forward_batch.forward_mode.is_target_verify() and self.topk == 1:
+            # NEXTN/MTP with topk=1 is a linear draft chain, so target verify's
+            # mask is ordinary bottom-right causal attention. Reuse the normal
+            # extend path, which gathers SHUFFLE fp8 cache and applies its
+            # per-token descales. The legacy extend_attention_fwd path below
+            # assumes scalar scales and corrupts verify logits.
+            return self._forward_extend_mha(q, k, v, layer, forward_batch)
         if forward_batch.forward_mode.is_target_verify() or is_draft_extend_mode(
             forward_batch.forward_mode, include_v2=True
         ):
@@ -2002,12 +2069,130 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _forward_extend_mha(self, q, k, v, layer, forward_batch):
         """Non-MLA extend path: standard MHA with flash_attn_varlen_func."""
-        seqlens_in_batch = forward_batch.seq_lens
-        cu_seqlens_q = torch.nn.functional.pad(
-            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-        )
-        if q.dtype != k.dtype and k.dtype == dtypes.fp8:
-            q = q.to(dtypes.fp8)
+        bs0 = forward_batch.batch_size + 1
+        qo_indptr = self.forward_metadata.qo_indptr[:bs0]
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens is None:
+            prefix_lens = forward_batch.extend_prefix_lens
+        if torch.is_tensor(prefix_lens):
+            extend_no_prefix = not bool(torch.any(prefix_lens).item())
+        else:
+            extend_no_prefix = prefix_lens is not None and not any(prefix_lens)
+
+        if extend_no_prefix:
+            # Fresh prompts contain their complete KV stream in k/v. This also
+            # covers the first chunk of chunked prefill.
+            k_attn = k.contiguous().view(
+                -1, layer.tp_k_head_num, layer.qk_head_dim
+            )
+            v_attn = v.contiguous().view(
+                -1, layer.tp_v_head_num, layer.v_head_dim
+            )
+            kv_indptr = qo_indptr
+            kv_indices = torch.arange(
+                k_attn.shape[0], dtype=torch.int32, device=k_attn.device
+            )
+            max_kv_len = self.forward_metadata.max_q_len
+        else:
+            # A later chunk must attend to prefix KV as well as its own newly
+            # written KV. The cache uses AITER's SHUFFLE layout, so gather it
+            # back to a linear token stream before calling varlen attention.
+            from sglang.kernels.ops.attention.utils import (
+                launch_gather_shuffle_5d_to_linear,
+            )
+
+            k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            num_slots, num_kv_heads, head_dim = k_buffer.shape
+            num_blocks = num_slots // self.page_size
+            x = 16 // k_buffer.element_size()
+            k_shuffle = k_buffer[: num_blocks * self.page_size].view(
+                num_blocks, num_kv_heads, head_dim // x, self.page_size, x
+            )
+            v_shuffle = v_buffer[: num_blocks * self.page_size].view(
+                num_blocks,
+                num_kv_heads,
+                self.page_size // x,
+                head_dim,
+                x,
+            )
+            kv_indptr = self.forward_metadata.kv_indptr[:bs0]
+            kv_lens = kv_indptr[1:bs0] - kv_indptr[: bs0 - 1]
+            total_kv = int(forward_batch.seq_lens_sum)
+            if forward_batch.forward_mode.is_target_verify():
+                total_kv += forward_batch.batch_size * int(
+                    self.forward_metadata.max_q_len
+                )
+            full_slot_ids = torch.empty(
+                total_kv, dtype=torch.int32, device=k_buffer.device
+            )
+            create_flashinfer_kv_indices_triton[(forward_batch.batch_size,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                full_slot_ids,
+                self.req_to_token.stride(0),
+            )
+            if self._mimo_mtp_uses_swa_pool:
+                full_slot_ids = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    full_slot_ids
+                )
+            slot_ids = full_slot_ids.long()
+            k_attn, v_attn = launch_gather_shuffle_5d_to_linear(
+                k_shuffle, v_shuffle, slot_ids
+            )
+            kv_indices = torch.arange(
+                total_kv, dtype=torch.int32, device=k_attn.device
+            )
+            max_kv_len = self.forward_metadata.max_kv_len
+            if max_kv_len is None:
+                max_kv_len = int(kv_lens.max().item())
+            if self.kv_cache_dtype == dtypes.fp8:
+                # The shuffle writer produces a per-token/per-head descale.
+                # Gather it with the same logical slot order and dequantize to
+                # the model dtype; flash varlen's descale inputs are scalar and
+                # cannot represent these dynamic scales.
+                k_scale, v_scale = self._ensure_fp8_kv_scales(
+                    layer, k_buffer, self.page_size
+                )
+                k_scale = (
+                    k_scale.permute(0, 2, 1)
+                    .reshape(-1, num_kv_heads)
+                    .index_select(0, slot_ids)
+                )
+                v_scale = (
+                    v_scale.permute(0, 2, 1)
+                    .reshape(-1, num_kv_heads)
+                    .index_select(0, slot_ids)
+                )
+                k_attn = k_attn.to(self.input_dtype) * k_scale.to(
+                    self.input_dtype
+                ).unsqueeze(-1)
+                v_attn = v_attn.to(self.input_dtype) * v_scale.to(
+                    self.input_dtype
+                ).unsqueeze(-1)
+
+        q_attn = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if q_attn.dtype != k_attn.dtype:
+            q_attn = q_attn.to(k_attn.dtype)
+        if get_bool_env_var("ATOM_DEBUG_MIMO_METADATA", "False") and layer.layer_id == 0:
+            q_total = int(qo_indptr[-1].item())
+            kv_total = int(kv_indptr[-1].item())
+            print(
+                "[ATOM-MiMoV2-MD] "
+                f"mode={forward_batch.forward_mode} "
+                f"q_shape={tuple(q_attn.shape)} k_shape={tuple(k_attn.shape)} "
+                f"qo_total={q_total} kv_total={kv_total} "
+                f"max_q={self.forward_metadata.max_q_len} max_kv={max_kv_len}",
+                flush=True,
+            )
+            if q_total != q_attn.shape[0] or kv_total != k_attn.shape[0]:
+                raise RuntimeError(
+                    "MiMo MHA metadata/tensor length mismatch: "
+                    f"qo_total={q_total}, q_tokens={q_attn.shape[0]}, "
+                    f"kv_total={kv_total}, kv_tokens={k_attn.shape[0]}"
+                )
         sliding_window_size = getattr(layer, "sliding_window_size", -1)
         window_size = (
             (sliding_window_size, 0, 0)
@@ -2015,13 +2200,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             else (-1, -1, 0)
         )
         o = flash_attn_varlen_func(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
-            v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_q,
+            q_attn,
+            k_attn,
+            v_attn,
+            cu_seqlens_q=qo_indptr,
+            cu_seqlens_k=kv_indptr,
             max_seqlen_q=self.forward_metadata.max_q_len,
-            max_seqlen_k=self.forward_metadata.max_kv_len,
+            max_seqlen_k=max_kv_len,
             min_seqlen_q=0,
             dropout_p=0.0,
             softmax_scale=self.scale,
@@ -2552,6 +2737,16 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        if self._mimo_mtp_uses_swa_pool:
+            return super().forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=kwargs.get("sinks"),
+            )
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
             return self._forward_sparse_mla(
@@ -2586,10 +2781,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         # Non-MLA decode paths
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
+        cache_loc = self._layer_cache_loc(layer, forward_batch.out_cache_loc)
         if use_native_dense_mha:
             if save_kv_cache:
                 self._set_kv_buffer_native_dense(
-                    layer, forward_batch.out_cache_loc, k, v, forward_batch
+                    layer, cache_loc, k, v, forward_batch
                 )
             return self._forward_decode_native_dense_mha(q, layer, forward_batch)
 
@@ -2608,7 +2804,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                         layer, k_buffer, self.page_size
                     )
                     self.set_kv_buffer_with_layout_shuffle(
-                        forward_batch.out_cache_loc,
+                        cache_loc,
                         k,
                         v,
                         k_buffer,
@@ -2619,7 +2815,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                     )
                 else:
                     self._set_kv_buffer_native_dense(
-                        layer, forward_batch.out_cache_loc, k, v, forward_batch
+                        layer, cache_loc, k, v, forward_batch
                     )
             return self._forward_decode_native_dense_mha(q, layer, forward_batch)
 
@@ -2631,7 +2827,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 layer, k_buffer, self.page_size
             )
             self.set_kv_buffer_with_layout_shuffle(
-                forward_batch.out_cache_loc,
+                cache_loc,
                 k,
                 v,
                 k_buffer,
@@ -2685,6 +2881,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             page_table = self.forward_metadata.page_table
+            if (
+                self._mimo_mtp_uses_swa_pool
+                and self.forward_metadata.swa_page_table is not None
+            ):
+                page_table = self.forward_metadata.swa_page_table
             if page_table is None:
                 raise AttributeError("ForwardMetadata.page_table is not initialized")
             if page_table.dtype != torch.int32:
@@ -2790,13 +2991,19 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if k_scale is not None and k_scale.numel() > 1:
                 k_scale = k_scale.unsqueeze(-1)
                 v_scale = v_scale.unsqueeze(-1)
+            page_table = self.forward_metadata.page_table
+            if (
+                self._mimo_mtp_uses_swa_pool
+                and self.forward_metadata.swa_page_table is not None
+            ):
+                page_table = self.forward_metadata.swa_page_table
             run_pa_decode_gluon(
                 output=out,
                 q=q_3d,
                 k_cache=k_cache,
                 v_cache=v_cache,
                 context_lens=self.forward_metadata.kv_lens,
-                block_tables=self.forward_metadata.page_table,
+                block_tables=page_table,
                 softmax_scale=layer.scaling,
                 max_seqlen_q=1,
                 max_context_partition_num=max_context_partition_num,
