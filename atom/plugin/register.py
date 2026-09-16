@@ -334,6 +334,14 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         )
         return "DeepSeek-V4-Pro" in model_path
 
+    def _is_mimo_v2_target_runner(runner) -> bool:
+        model = getattr(runner, "model", None)
+        if getattr(model, "model_arch", None) == "MiMoV2ForCausalLM":
+            return True
+        hf_config = getattr(getattr(runner, "model_config", None), "hf_config", None)
+        architectures = list(getattr(hf_config, "architectures", None) or [])
+        return "MiMoV2ForCausalLM" in architectures
+
     def _draft_extend_graph_enabled(runner) -> bool:
         if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG"):
             return False
@@ -365,6 +373,22 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
 
     if not getattr(CudaGraphRunner, "_atom_dsv4_spec_can_run_patched", False):
         original_can_run = getattr(CudaGraphRunner, can_run_method)
+        original_capture = CudaGraphRunner.capture
+
+        def capture(self):
+            model_runner = getattr(self, "model_runner", None)
+            spec_algorithm = getattr(model_runner, "spec_algorithm", None)
+            is_speculative = bool(
+                getattr(spec_algorithm, "is_speculative", lambda: False)()
+            )
+            if _is_mimo_v2_target_runner(model_runner) and is_speculative:
+                logger.warning(
+                    "Skipping MiMo-V2 target-verify CUDA graph capture; "
+                    "capture currently corrupts fp8 KV state. Target-only "
+                    "decode graphs remain enabled."
+                )
+                return None
+            return original_capture(self)
 
         def can_run(self, forward_batch):
             try:
@@ -379,6 +403,11 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         include_v2=True
                     )
                 )
+                if (
+                    _is_mimo_v2_target_runner(model_runner)
+                    and is_target_verify
+                ):
+                    return False
                 if (
                     is_supported_model
                     and is_target_verify
@@ -400,6 +429,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             return original_can_run(self, forward_batch)
 
         setattr(CudaGraphRunner, can_run_method, can_run)
+        CudaGraphRunner.capture = capture
         CudaGraphRunner._atom_dsv4_spec_can_run_patched = True
 
     if not getattr(EAGLEDraftCudaGraphRunner, "_atom_dsv4_replay_patched", False):
