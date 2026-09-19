@@ -202,6 +202,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+        self._mimo_target_graph_capture = False
         if self._mimo_mtp_uses_swa_pool:
             return super().init_forward_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -228,7 +229,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         in_capture: bool = False,
     ):
         """Build ATOM metadata for SGLang's split CUDA graph init protocol."""
-        if self._mimo_mtp_uses_swa_pool:
+        is_mimo_target_verify = (
+            self._is_mimo_v2_family
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if is_mimo_target_verify:
+            self._mimo_target_graph_capture = True
+        if self._mimo_mtp_uses_swa_pool or is_mimo_target_verify:
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
@@ -926,6 +933,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         max_num_tokens: int,
         kv_indices_buf: torch.Tensor | None = None,
     ):
+        if self._is_mimo_v2_family:
+            super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+
         from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
             init_sparse_mla_graph_state,
         )
@@ -1956,6 +1966,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
         if (
             self._is_mimo_v2_family
+            and getattr(self, "_mimo_target_graph_capture", False)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            return self._forward_target_verify_mimo_graph(q, layer, forward_batch)
+        if (
+            self._is_mimo_v2_family
             and forward_batch.forward_mode.is_target_verify()
             and self.topk == 1
         ):
@@ -1975,6 +1991,29 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             return self._forward_extend_mha_mimo(q, k, v, layer, forward_batch)
         else:
             return self._forward_extend_mha(q, k, v, layer, forward_batch)
+
+    def _forward_target_verify_mimo_graph(self, q, layer, forward_batch):
+        """Run MiMo's linear NEXTN verify chain with graph-safe paged decode."""
+        tokens_per_req = int(self.forward_metadata.max_q_len)
+        batch_size = forward_batch.batch_size
+        q = q.view(
+            batch_size,
+            tokens_per_req,
+            layer.tp_q_head_num * layer.qk_head_dim,
+        )
+        base_kv_lens = forward_batch.seq_lens
+        if not hasattr(self.forward_metadata, "page_table"):
+            self.forward_metadata.page_table = self.forward_metadata.kv_indices
+        outputs = []
+        for step in range(tokens_per_req):
+            self.forward_metadata.kv_lens = base_kv_lens + step + 1
+            outputs.append(
+                self._forward_decode_native_dense_mha(
+                    q[:, step], layer, forward_batch
+                )
+            )
+        self.forward_metadata.kv_lens = base_kv_lens
+        return torch.stack(outputs, dim=1).flatten(0, 1)
 
     def _forward_extend_native_dense_mha(self, q, layer, forward_batch):
         k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
