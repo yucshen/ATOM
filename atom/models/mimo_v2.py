@@ -514,9 +514,11 @@ class MiMoV2Model(nn.Module):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
-        hidden_states_before_norm = (
-            hidden_states if residual is None else hidden_states + residual
-        )
+        hidden_states_before_norm = None
+        if return_hidden_states_before_norm:
+            hidden_states_before_norm = (
+                hidden_states if residual is None else hidden_states + residual
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
 
         if return_hidden_states_before_norm:

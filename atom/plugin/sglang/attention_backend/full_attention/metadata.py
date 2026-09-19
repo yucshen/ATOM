@@ -31,9 +31,6 @@ class ForwardMetadata:
     custom_mask: torch.Tensor | None = None
     mask_indptr: torch.Tensor | None = None
     max_extend_len: int | None = None
-    swa_out_cache_loc: torch.Tensor | None = None
-    swa_kv_indices: torch.Tensor | None = None
-    swa_page_table: torch.Tensor | None = None
     # PA metadata for pa_persistent_fwd (only used in decode mode, non-MLA)
     pa_metadata_qo_indptr: torch.Tensor | None = None
     pa_metadata_pages_kv_indptr: torch.Tensor | None = None

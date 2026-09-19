@@ -484,9 +484,10 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                     hidden_states_before_norm = aux_hidden_states
                     aux_hidden_states = None
                 hidden_states = runtime.trim_output(hidden_states)
-                hidden_states_before_norm = self._trim_aux_hidden_states(
-                    runtime, hidden_states_before_norm
-                )
+                if hidden_states_before_norm is not None:
+                    hidden_states_before_norm = self._trim_aux_hidden_states(
+                        runtime, hidden_states_before_norm
+                    )
                 aux_hidden_states = self._trim_aux_hidden_states(
                     runtime, aux_hidden_states
                 )
@@ -522,13 +523,21 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             aux_hidden_states=aux_hidden_states,
                             hidden_states_before_norm=hidden_states,
                         )
+                    if self.model_arch == "MiMoV2ForCausalLM":
+                        return self.logits_processor(
+                            logits_input_ids,
+                            hidden_states,
+                            self.logits_head,
+                            forward_batch,
+                            aux_hidden_states=aux_hidden_states,
+                            hidden_states_before_norm=hidden_states_before_norm,
+                        )
                     return self.logits_processor(
                         logits_input_ids,
                         hidden_states,
                         self.logits_head,
                         forward_batch,
                         aux_hidden_states=aux_hidden_states,
-                        hidden_states_before_norm=hidden_states_before_norm,
                     )
                 return hidden_states
 

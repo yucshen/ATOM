@@ -103,6 +103,7 @@ def load_weights_into_model(
     is_rank0: Callable[[], bool],
     weights_iterator: Callable[..., Iterable[tuple[str, torch.Tensor]]],
     online_quant_streamer: "OnlineQuantStreamer | None" = None,
+    limit_pending_futures: bool = False,
 ) -> set[str]:
     """Copy every checkpoint tensor into the model parameter it belongs to.
 
@@ -220,7 +221,11 @@ def load_weights_into_model(
         # entire large checkpoint resident on CPU for every TP process when
         # the iterator outruns H2D/expert staging.  Apply backpressure while
         # still leaving one full wave queued behind the workers.
-        if executor is not None and len(futures) >= 2 * num_threads:
+        if (
+            executor is not None
+            and limit_pending_futures
+            and len(futures) >= 2 * num_threads
+        ):
             futures.pop(0).result()
 
     batching_excluded = None

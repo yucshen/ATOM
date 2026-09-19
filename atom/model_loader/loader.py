@@ -312,6 +312,10 @@ def load_model(
         is_rank0=_is_rank0,
         weights_iterator=weights_iterator_override or safetensors_weights_iterator,
         online_quant_streamer=online_quant_streamer,
+        # SGLang's MiMo iterator can read shards substantially faster than
+        # ATOM stages them to the device. Bound that plugin-only pipeline while
+        # preserving the mainline loader behavior for every existing caller.
+        limit_pending_futures=weights_iterator_override is not None,
     )
 
     # Dummy modes other than "empty" fill the skipped-load params with finite

@@ -115,6 +115,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         architectures = list(
             getattr(model_runner.model_config.hf_config, "architectures", None) or []
         )
+        self._is_mimo_v2_family = any(
+            arch in {"MiMoV2ForCausalLM", "MiMoV2MTP"} for arch in architectures
+        )
         self._mimo_mtp_uses_swa_pool = (
             "MiMoV2MTP" in architectures and self.use_sliding_window_kv_pool
         )
@@ -218,31 +221,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
-        self._bind_mimo_mtp_swa_metadata(forward_batch)
-
-    def _bind_mimo_mtp_swa_metadata(self, forward_batch: ForwardBatch) -> None:
-        """Translate full-pool scheduler locations for MiMo's all-SWA draft."""
-        if not self._mimo_mtp_uses_swa_pool or self.forward_metadata is None:
-            return
-        pool = self.token_to_kv_pool
-        if forward_batch.out_cache_loc is not None:
-            self.forward_metadata.swa_out_cache_loc = (
-                pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
-            )
-        if self.forward_metadata.kv_indices is not None:
-            self.forward_metadata.swa_kv_indices = pool.translate_loc_from_full_to_swa(
-                self.forward_metadata.kv_indices
-            )
-        if self.forward_metadata.page_table is not None:
-            num_pages = self.forward_metadata.page_table.shape[1]
-            full_page_slots = self.req_to_token[
-                forward_batch.req_pool_indices[:, None],
-                self.strided_indices[:num_pages][None, :],
-            ]
-            self.forward_metadata.swa_page_table = (
-                pool.translate_loc_from_full_to_swa(full_page_slots)
-                // self.page_size
-            ).to(torch.int32)
 
     def init_forward_metadata_out_graph(
         self,
@@ -276,7 +254,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
-        self._bind_mimo_mtp_swa_metadata(forward_batch)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
@@ -863,7 +840,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             raise RuntimeError("MHA target_verify requires speculative metadata")
 
         draft_num = spec_info.draft_token_num
-        kv_lens = forward_batch.seq_lens + draft_num
+        kv_lens = forward_batch.seq_lens
+        if self._is_mimo_v2_family:
+            # SGLang's MiMo NEXTN batch reports the committed prefix length;
+            # include the draft rows that target verification must attend to.
+            kv_lens = kv_lens + draft_num
         qo_indptr = torch.arange(
             0,
             (1 + bs) * draft_num,
@@ -899,7 +880,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             qo_indptr,
             None,
             draft_num,
-            self._max_len(None, kv_lens),
+            self._max_len(None, kv_lens) if self._is_mimo_v2_family else None,
             None,
             None,
             custom_mask=spec_info.custom_mask,
@@ -1798,14 +1779,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             sinks = sinks.to(torch.float32)
         return sinks
 
-    def _layer_cache_loc(self, layer, cache_loc):
-        if (
-            self._mimo_mtp_uses_swa_pool
-            and self.forward_metadata.swa_out_cache_loc is not None
-        ):
-            return self.forward_metadata.swa_out_cache_loc
-        return cache_loc
-
     def _should_use_native_dense_mha(self, layer) -> bool:
         sliding_window_size = getattr(layer, "sliding_window_size", None)
         return (
@@ -1950,7 +1923,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-        cache_loc = self._layer_cache_loc(layer, cache_loc)
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
 
         if k is not None:
@@ -1982,19 +1954,25 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         if self.use_mla:
             return self._forward_extend_mla(q, k, v, layer, forward_batch)
-        if forward_batch.forward_mode.is_target_verify() and self.topk == 1:
+        if (
+            self._is_mimo_v2_family
+            and forward_batch.forward_mode.is_target_verify()
+            and self.topk == 1
+        ):
             # NEXTN/MTP with topk=1 is a linear draft chain, so target verify's
             # mask is ordinary bottom-right causal attention. Reuse the normal
             # extend path, which gathers SHUFFLE fp8 cache and applies its
             # per-token descales. The legacy extend_attention_fwd path below
             # assumes scalar scales and corrupts verify logits.
-            return self._forward_extend_mha(q, k, v, layer, forward_batch)
+            return self._forward_extend_mha_mimo(q, k, v, layer, forward_batch)
         if forward_batch.forward_mode.is_target_verify() or is_draft_extend_mode(
             forward_batch.forward_mode, include_v2=True
         ):
             return self._forward_extend_mha_speculative(q, k, v, layer, forward_batch)
         if use_native_dense_mha:
             return self._forward_extend_native_dense_mha(q, layer, forward_batch)
+        if self._is_mimo_v2_family:
+            return self._forward_extend_mha_mimo(q, k, v, layer, forward_batch)
         else:
             return self._forward_extend_mha(q, k, v, layer, forward_batch)
 
@@ -2069,6 +2047,36 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def _forward_extend_mha(self, q, k, v, layer, forward_batch):
         """Non-MLA extend path: standard MHA with flash_attn_varlen_func."""
+        seqlens_in_batch = forward_batch.seq_lens
+        cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+        )
+        if q.dtype != k.dtype and k.dtype == dtypes.fp8:
+            q = q.to(dtypes.fp8)
+        sliding_window_size = getattr(layer, "sliding_window_size", -1)
+        window_size = (
+            (sliding_window_size, 0, 0)
+            if sliding_window_size and sliding_window_size > 0
+            else (-1, -1, 0)
+        )
+        o = flash_attn_varlen_func(
+            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k.contiguous().view(-1, layer.tp_k_head_num, layer.head_dim),
+            v.contiguous().view(-1, layer.tp_v_head_num, layer.head_dim),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_q=self.forward_metadata.max_q_len,
+            max_seqlen_k=self.forward_metadata.max_kv_len,
+            min_seqlen_q=0,
+            dropout_p=0.0,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=window_size,
+            sink_ptr=self._layer_sink_ptr(layer),
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_mha_mimo(self, q, k, v, layer, forward_batch):
         bs0 = forward_batch.batch_size + 1
         qo_indptr = self.forward_metadata.qo_indptr[:bs0]
         prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -2089,9 +2097,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 -1, layer.tp_v_head_num, layer.v_head_dim
             )
             kv_indptr = qo_indptr
-            kv_indices = torch.arange(
-                k_attn.shape[0], dtype=torch.int32, device=k_attn.device
-            )
             max_kv_len = self.forward_metadata.max_q_len
         else:
             # A later chunk must attend to prefix KV as well as its own newly
@@ -2117,33 +2122,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
             kv_indptr = self.forward_metadata.kv_indptr[:bs0]
             kv_lens = kv_indptr[1:bs0] - kv_indptr[: bs0 - 1]
-            total_kv = int(forward_batch.seq_lens_sum)
-            if forward_batch.forward_mode.is_target_verify():
-                total_kv += forward_batch.batch_size * int(
-                    self.forward_metadata.max_q_len
-                )
-            full_slot_ids = torch.empty(
-                total_kv, dtype=torch.int32, device=k_buffer.device
-            )
-            create_flashinfer_kv_indices_triton[(forward_batch.batch_size,)](
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                full_slot_ids,
-                self.req_to_token.stride(0),
-            )
-            if self._mimo_mtp_uses_swa_pool:
-                full_slot_ids = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    full_slot_ids
-                )
-            slot_ids = full_slot_ids.long()
+            total_kv = int(kv_indptr[-1].item())
+            slot_ids = self.forward_metadata.kv_indices[:total_kv].long()
             k_attn, v_attn = launch_gather_shuffle_5d_to_linear(
                 k_shuffle, v_shuffle, slot_ids
-            )
-            kv_indices = torch.arange(
-                total_kv, dtype=torch.int32, device=k_attn.device
             )
             max_kv_len = self.forward_metadata.max_kv_len
             if max_kv_len is None:
@@ -2176,23 +2158,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         q_attn = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if q_attn.dtype != k_attn.dtype:
             q_attn = q_attn.to(k_attn.dtype)
-        if get_bool_env_var("ATOM_DEBUG_MIMO_METADATA", "False") and layer.layer_id == 0:
-            q_total = int(qo_indptr[-1].item())
-            kv_total = int(kv_indptr[-1].item())
-            print(
-                "[ATOM-MiMoV2-MD] "
-                f"mode={forward_batch.forward_mode} "
-                f"q_shape={tuple(q_attn.shape)} k_shape={tuple(k_attn.shape)} "
-                f"qo_total={q_total} kv_total={kv_total} "
-                f"max_q={self.forward_metadata.max_q_len} max_kv={max_kv_len}",
-                flush=True,
-            )
-            if q_total != q_attn.shape[0] or kv_total != k_attn.shape[0]:
-                raise RuntimeError(
-                    "MiMo MHA metadata/tensor length mismatch: "
-                    f"qo_total={q_total}, q_tokens={q_attn.shape[0]}, "
-                    f"kv_total={kv_total}, kv_tokens={k_attn.shape[0]}"
-                )
         sliding_window_size = getattr(layer, "sliding_window_size", -1)
         window_size = (
             (sliding_window_size, 0, 0)
@@ -2781,7 +2746,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
         # Non-MLA decode paths
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
-        cache_loc = self._layer_cache_loc(layer, forward_batch.out_cache_loc)
+        cache_loc = forward_batch.out_cache_loc
         if use_native_dense_mha:
             if save_kv_cache:
                 self._set_kv_buffer_native_dense(
@@ -2796,7 +2761,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             and layer.head_dim == layer.qk_head_dim
         ):
             if save_kv_cache:
-                if self.kv_cache_dtype == dtypes.fp8:
+                if self._is_mimo_v2_family and self.kv_cache_dtype == dtypes.fp8:
                     k_buffer, v_buffer = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
@@ -2881,11 +2846,6 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             page_table = self.forward_metadata.page_table
-            if (
-                self._mimo_mtp_uses_swa_pool
-                and self.forward_metadata.swa_page_table is not None
-            ):
-                page_table = self.forward_metadata.swa_page_table
             if page_table is None:
                 raise AttributeError("ForwardMetadata.page_table is not initialized")
             if page_table.dtype != torch.int32:
@@ -2925,7 +2885,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             num_slots, num_kv_heads, head_size = k_cache.shape
             num_blocks = num_slots // block_size
             x = 16 // k_cache.element_size()
-            if self.kv_cache_dtype == dtypes.fp8:
+            if self._is_mimo_v2_family and self.kv_cache_dtype == dtypes.fp8:
                 # The fp8 cache is written by
                 # reshape_and_cache_with_pertoken_quant(asm_layout=True), so its
                 # flat SGLang storage already has the shuffle layout expected by
@@ -2987,16 +2947,13 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 dtype=q.dtype,
                 device=q.device,
             )
-            k_scale, v_scale = self._kv_descales(layer)
-            if k_scale is not None and k_scale.numel() > 1:
-                k_scale = k_scale.unsqueeze(-1)
-                v_scale = v_scale.unsqueeze(-1)
+            k_scale, v_scale = None, None
+            if self._is_mimo_v2_family:
+                k_scale, v_scale = self._kv_descales(layer)
+                if k_scale is not None and k_scale.numel() > 1:
+                    k_scale = k_scale.unsqueeze(-1)
+                    v_scale = v_scale.unsqueeze(-1)
             page_table = self.forward_metadata.page_table
-            if (
-                self._mimo_mtp_uses_swa_pool
-                and self.forward_metadata.swa_page_table is not None
-            ):
-                page_table = self.forward_metadata.swa_page_table
             run_pa_decode_gluon(
                 output=out,
                 q=q_3d,
@@ -3010,7 +2967,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 context_partition_size=context_partition_size,
                 compute_type=(
                     dtypes.fp8
-                    if self.kv_cache_dtype == dtypes.fp8
+                    if self._is_mimo_v2_family
+                    and self.kv_cache_dtype == dtypes.fp8
                     else torch.bfloat16
                 ),
                 q_scale=None,
