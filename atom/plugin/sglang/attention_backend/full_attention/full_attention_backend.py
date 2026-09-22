@@ -118,9 +118,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         self._is_mimo_v2_family = any(
             arch in {"MiMoV2ForCausalLM", "MiMoV2MTP"} for arch in architectures
         )
-        self._mimo_mtp_uses_swa_pool = (
-            "MiMoV2MTP" in architectures and self.use_sliding_window_kv_pool
-        )
+        # MiMo's draft uses the native AITER cache/attention contract. This is
+        # independent of whether SGLang allocates a hybrid or ordinary KV pool.
+        self._is_mimo_mtp = "MiMoV2MTP" in architectures
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -203,7 +203,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
         self._mimo_target_graph_capture = False
-        if self._mimo_mtp_uses_swa_pool:
+        if self._is_mimo_mtp:
             return super().init_forward_metadata(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
@@ -222,6 +222,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self._init_forward_metadata_extend(forward_batch)
         self._fixup_page_table(forward_batch)
+        self._init_mimo_swa_metadata(forward_batch)
 
     def init_forward_metadata_out_graph(
         self,
@@ -235,7 +236,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
         if is_mimo_target_verify:
             self._mimo_target_graph_capture = True
-        if self._mimo_mtp_uses_swa_pool or is_mimo_target_verify:
+        if self._is_mimo_mtp or is_mimo_target_verify:
             return super().init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
             )
@@ -261,10 +262,60 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 forward_batch.seq_lens_cpu,
                 forward_batch.out_cache_loc,
             )
+        self._init_mimo_swa_metadata(forward_batch, for_cuda_graph=True)
+
+    def _is_mimo_swa_layer(self, layer) -> bool:
+        return (
+            self._is_mimo_v2_family
+            and self.use_sliding_window_kv_pool
+            and self.token_to_kv_pool.layers_mapping[layer.layer_id][1]
+        )
+
+    def _init_mimo_swa_metadata(self, forward_batch, for_cuda_graph=False):
+        """Translate MiMo target indices once per batch, before any layer runs.
+
+        The allocator records full-pool slots in out_cache_loc and req_to_token.
+        SWA slots can diverge as soon as a window is evicted, even if both pools
+        have the same capacity. Native AITER already prepares these translations
+        for MTP and graph target verification; the ATOM metadata paths need them
+        too, while retaining the original indices for full-attention layers.
+        """
+        if not (self._is_mimo_v2_family and self.use_sliding_window_kv_pool):
+            return
+
+        md = self.forward_metadata
+        translate = self.token_to_kv_pool.translate_loc_from_full_to_swa
+        if forward_batch.out_cache_loc is not None:
+            swa_loc = translate(forward_batch.out_cache_loc)
+            if for_cuda_graph:
+                # Captured writers must keep the same tensor addresses on replay.
+                buf = self.cuda_graph_swa_out_cache_loc
+                buf.zero_()
+                buf[: swa_loc.numel()].copy_(swa_loc)
+                swa_loc = buf[: swa_loc.numel()]
+            md.swa_out_cache_loc = swa_loc
+
+        if md.page_table is not None:
+            # Page tables hold page IDs; the allocator mapping holds token IDs.
+            # Preserve the -1 sentinel when converting the first slot of a page.
+            full_slots = torch.where(
+                md.page_table >= 0, md.page_table.long() * self.page_size, -1
+            )
+            swa_pages = (translate(full_slots) // self.page_size).to(torch.int32)
+            if for_cuda_graph:
+                buf = self.cuda_graph_swa_page_table
+                buf.zero_()
+                rows, cols = swa_pages.shape
+                buf[:rows, :cols].copy_(swa_pages)
+                swa_pages = buf[:rows, :cols]
+            md.swa_page_table = swa_pages
+
+        if not for_cuda_graph and md.kv_indices is not None:
+            md.swa_kv_indices = translate(md.kv_indices).to(md.kv_indices.dtype)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """ATOM's full-attention metadata is prepared outside the captured graph."""
-        if self._mimo_mtp_uses_swa_pool:
+        if self._is_mimo_mtp:
             return super().init_forward_metadata_in_graph(forward_batch)
         return
 
@@ -1859,8 +1910,20 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             return
 
         self.token_to_kv_pool.set_kv_buffer(
-            layer, cache_loc, k, v, k_descale, v_descale
+            layer,
+            self._mimo_native_write_loc(layer, cache_loc, forward_batch),
+            k,
+            v,
+            k_descale,
+            v_descale,
         )
+
+    def _mimo_native_write_loc(self, layer, cache_loc, forward_batch):
+        if self._is_mimo_swa_layer(layer):
+            from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+            return KVWriteLoc(forward_batch.out_cache_loc, cache_loc)
+        return cache_loc
 
     def set_kv_buffer_with_layout_shuffle(
         self,
@@ -1912,7 +1975,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def forward_extend(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
-        if self._mimo_mtp_uses_swa_pool:
+        if self._is_mimo_mtp:
+            # ATOM's RadixAttention adapter attaches sinks to the layer;
+            # native AITER consumes an explicit argument instead.
+            sinks = kwargs.get("sinks")
+            if sinks is None:
+                sinks = self._layer_sink_ptr(layer)
             return super().forward_extend(
                 q,
                 k,
@@ -1920,7 +1988,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
-                sinks=kwargs.get("sinks"),
+                sinks=sinks,
             )
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
@@ -1933,6 +2001,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
+        if self._is_mimo_swa_layer(layer):
+            cache_loc = self.forward_metadata.swa_out_cache_loc
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
 
         if k is not None:
@@ -2162,7 +2232,12 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             kv_indptr = self.forward_metadata.kv_indptr[:bs0]
             kv_lens = kv_indptr[1:bs0] - kv_indptr[: bs0 - 1]
             total_kv = int(kv_indptr[-1].item())
-            slot_ids = self.forward_metadata.kv_indices[:total_kv].long()
+            kv_indices = (
+                self.forward_metadata.swa_kv_indices
+                if self._is_mimo_swa_layer(layer)
+                else self.forward_metadata.kv_indices
+            )
+            slot_ids = kv_indices[:total_kv].long()
             k_attn, v_attn = launch_gather_shuffle_5d_to_linear(
                 k_shuffle, v_shuffle, slot_ids
             )
@@ -2741,7 +2816,10 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
-        if self._mimo_mtp_uses_swa_pool:
+        if self._is_mimo_mtp:
+            sinks = kwargs.get("sinks")
+            if sinks is None:
+                sinks = self._layer_sink_ptr(layer)
             return super().forward_decode(
                 q,
                 k,
@@ -2749,7 +2827,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 layer,
                 forward_batch,
                 save_kv_cache=save_kv_cache,
-                sinks=kwargs.get("sinks"),
+                sinks=sinks,
             )
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
@@ -2786,6 +2864,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         # Non-MLA decode paths
         use_native_dense_mha = self._should_use_native_dense_mha(layer)
         cache_loc = forward_batch.out_cache_loc
+        if self._is_mimo_swa_layer(layer):
+            cache_loc = self.forward_metadata.swa_out_cache_loc
         if use_native_dense_mha:
             if save_kv_cache:
                 self._set_kv_buffer_native_dense(
@@ -2884,7 +2964,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            page_table = self.forward_metadata.page_table
+            page_table = (
+                self.forward_metadata.swa_page_table
+                if self._is_mimo_swa_layer(layer)
+                else self.forward_metadata.page_table
+            )
             if page_table is None:
                 raise AttributeError("ForwardMetadata.page_table is not initialized")
             if page_table.dtype != torch.int32:
@@ -2992,7 +3076,11 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 if k_scale is not None and k_scale.numel() > 1:
                     k_scale = k_scale.unsqueeze(-1)
                     v_scale = v_scale.unsqueeze(-1)
-            page_table = self.forward_metadata.page_table
+            page_table = (
+                self.forward_metadata.swa_page_table
+                if self._is_mimo_swa_layer(layer)
+                else self.forward_metadata.page_table
+            )
             run_pa_decode_gluon(
                 output=out,
                 q=q_3d,
